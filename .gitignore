@@ -1,0 +1,6 @@
+ws/build/
+ws/cache/
+ws/install/
+ws/log/
+.bash_history
+**/__pycache__/*

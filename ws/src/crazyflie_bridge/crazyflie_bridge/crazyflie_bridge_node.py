@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 
+import csv
 import logging
+import os
 import time
 import sys
 import select
 import termios
 import tty
 import math
+from datetime import datetime
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
@@ -96,13 +99,14 @@ logger = logging.getLogger(__name__)
 URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E7')
 
 class CrazyflieController:
-    def __init__(self, uri, use_mocap=True):
+    def __init__(self, uri, use_mocap=True, trajectory_file=''):
         self.uri = uri
         self.scf = None
         self.is_flying = False
         self.target_height = 0.0
-        self.state = 'IDLE'  # IDLE, TAKING_OFF, FLYING, LANDING
+        self.state = 'IDLE'  # IDLE, TAKING_OFF, FLYING, LANDING, PLAYING_TRAJECTORY
         self.use_mocap = use_mocap
+        self.trajectory_file = trajectory_file or 'trajectory.csv'
         
         # Target position for mocap mode
         self.target_x = 0.0
@@ -112,6 +116,13 @@ class CrazyflieController:
         
         # Current mocap pose (updated from external source)
         self.current_yaw = 0.0  # Current yaw from mocap in radians
+        
+        # Trajectory playback: waypoints (relative), origin, start time, next index, mocap log file
+        self.trajectory_waypoints = []
+        self.trajectory_origin = None  # (x, y, z, yaw_deg) in world frame when trajectory started
+        self.trajectory_start_time = 0.0
+        self.trajectory_next_index = 0  # next CSV line to apply when its time is reached
+        self.mocap_log_file = None
         
         # Timing control
         self.last_extpos_time = 0
@@ -132,6 +143,40 @@ class CrazyflieController:
         
     def _param_callback(self, name, value):
         logger.info(f'Parameter {name} set to {value}')
+    
+    def load_trajectory(self, filepath):
+        """
+        Load trajectory from CSV: time_ms, x, y, z, yaw (time in ms from 0).
+        x, y, z are in meters and yaw in degrees; all are RELATIVE (offsets from start).
+        Returns list of (time_ms, dx, dy, dz, dyaw_deg) or empty list on error.
+        """
+        waypoints = []
+        path = os.path.expanduser(filepath)
+        if not os.path.isfile(path):
+            logger.error(f"Trajectory file not found: {path}")
+            return waypoints
+        try:
+            with open(path, newline='') as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if not row or row[0].strip().startswith('#'):
+                        continue
+                    if len(row) < 5:
+                        continue
+                    try:
+                        t_ms = float(row[0].strip())
+                        x = float(row[1].strip())
+                        y = float(row[2].strip())
+                        z = float(row[3].strip())
+                        yaw = float(row[4].strip())
+                        waypoints.append((t_ms, x, y, z, yaw))
+                    except (ValueError, IndexError):
+                        continue
+            waypoints.sort(key=lambda w: w[0])
+            logger.info(f"Loaded {len(waypoints)} waypoints from {path}")
+        except Exception as e:
+            logger.error(f"Failed to load trajectory: {e}")
+        return waypoints
     
     def setup_logging(self, cf):
         """Setup logging configuration for state estimation"""
@@ -215,6 +260,7 @@ class CrazyflieController:
             logger.info("  a/d = move left/right (body frame, 0.1m)")
             logger.info("  e/r = rotate yaw left/right (15 deg)")
             logger.info("  0 = reset yaw reference (drone must face +X)")
+            logger.info("  T = play trajectory from CSV (time_ms, dx, dy, dz, dyaw) relative to current pose")
             logger.info("  1 = switch to PID controller")
             logger.info("  6 = switch to INDI controller")
             logger.info("  q = quit and land")
@@ -265,7 +311,21 @@ class CrazyflieController:
                         try:
                             x, y, z, qx, qy, qz, qw, mode = mocap_func()
                             if x > -25.0:  # Check for valid mocap data
-                                
+                                # Log mocap to CSV while playing trajectory
+                                if self.state == 'PLAYING_TRAJECTORY' and self.mocap_log_file is not None and self.trajectory_origin is not None:
+                                    elapsed_ms = (current_time - self.trajectory_start_time) * 1000.0
+                                    ox, oy, oz, oyaw = self.trajectory_origin
+                                    yaw_rad = quaternion_to_yaw(qx, qy, qz, qw)
+                                    yaw_deg = math.degrees(yaw_rad)
+                                    rel_yaw = yaw_deg - oyaw
+                                    if rel_yaw > 180:
+                                        rel_yaw -= 360
+                                    elif rel_yaw < -180:
+                                        rel_yaw += 360
+                                    self.mocap_log_file.write(
+                                        f"{elapsed_ms:.2f},{x - ox:.6f},{y - oy:.6f},{z - oz:.6f},{rel_yaw:.4f}\n"
+                                    )
+                                    self.mocap_log_file.flush()
                                 if mode == 'position_only':
                                     # SINGLE MARKER MODE
                                     # Only send position - IMU handles all orientation
@@ -295,6 +355,32 @@ class CrazyflieController:
                     try:
                         if self.use_mocap:
                             # MOCAP MODE - Use absolute position setpoints
+                            if self.state == 'PLAYING_TRAJECTORY':
+                                elapsed_ms = (current_time - self.trajectory_start_time) * 1000.0
+                                ox, oy, oz, oyaw = self.trajectory_origin or (0, 0, 0, 0)
+                                # Apply at most one waypoint per setpoint tick when its time is reached
+                                # (so point 1 at 10s is applied after many 50Hz loops of mocap/setpoint, not in one batch)
+                                if self.trajectory_next_index < len(self.trajectory_waypoints):
+                                    t_ms, dx, dy, dz, dyaw_deg = self.trajectory_waypoints[self.trajectory_next_index]
+                                    if elapsed_ms >= t_ms:
+                                        self.target_x = ox + dx
+                                        self.target_y = oy + dy
+                                        self.target_z = oz + dz
+                                        self.target_yaw = oyaw + dyaw_deg
+                                        if self.target_yaw > 180:
+                                            self.target_yaw -= 360
+                                        elif self.target_yaw < -180:
+                                            self.target_yaw += 360
+                                        self.trajectory_next_index += 1
+                                if self.trajectory_next_index >= len(self.trajectory_waypoints):
+                                    self.state = 'FLYING'
+                                    self.trajectory_origin = None
+                                    self.trajectory_next_index = 0
+                                    if self.mocap_log_file is not None:
+                                        self.mocap_log_file.close()
+                                        self.mocap_log_file = None
+                                    logger.info("✓ Trajectory playback finished")
+                            
                             if self.state == 'TAKING_OFF':
                                 # Gradual takeoff to target height
                                 if self.target_z < 0.5:
@@ -313,7 +399,7 @@ class CrazyflieController:
                                     logger.info("✓ Landing complete, now IDLE")
                             
                             # Send position setpoint
-                            if self.state in ['TAKING_OFF', 'FLYING', 'LANDING']:
+                            if self.state in ['TAKING_OFF', 'FLYING', 'LANDING', 'PLAYING_TRAJECTORY']:
                                 cf.commander.send_position_setpoint(
                                     self.target_x,
                                     self.target_y,
@@ -365,6 +451,12 @@ class CrazyflieController:
         except KeyboardInterrupt:
             logger.info("Control loop interrupted")
         finally:
+            if self.mocap_log_file is not None:
+                try:
+                    self.mocap_log_file.close()
+                except OSError:
+                    pass
+                self.mocap_log_file = None
             # Restore terminal settings
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
             # Send stop command
@@ -466,6 +558,33 @@ class CrazyflieController:
             except Exception as e:
                 logger.error(f"Failed to set controller: {e}")
         
+        # Trajectory playback from CSV (T = shift+t). Trajectory is relative to current position.
+        elif key == 'T':
+            if self.state == 'FLYING' and self.use_mocap:
+                self.trajectory_waypoints = self.load_trajectory(self.trajectory_file)
+                if not self.trajectory_waypoints:
+                    logger.warning("No trajectory loaded - check trajectory_file path")
+                else:
+                    self.trajectory_origin = (self.target_x, self.target_y, self.target_z, self.target_yaw)
+                    self.trajectory_next_index = 0
+                    self.state = 'PLAYING_TRAJECTORY'
+                    self.trajectory_start_time = time.time()
+                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    mocap_log_path = f"mocap_log_{ts}.csv"
+                    try:
+                        self.mocap_log_file = open(mocap_log_path, 'w')
+                        self.mocap_log_file.write("time_ms,x,y,z,yaw_deg\n")
+                        self.mocap_log_file.flush()
+                        logger.info(
+                            f"▶ Playing trajectory from {self.trajectory_file} (origin=current position), "
+                            f"logging mocap (relative) to {mocap_log_path}"
+                        )
+                    except OSError as e:
+                        logger.error(f"Could not open mocap log file {mocap_log_path}: {e}")
+                        self.mocap_log_file = None
+            else:
+                logger.warning("⚠ Start trajectory only when FLYING with mocap (press T)")
+        
         # Yaw/Kalman reset - use when drone is facing +X to reset yaw reference
         elif key == '0':
             try:
@@ -563,6 +682,8 @@ class CrazyflieROS2Node(Node):
         # 'position_and_yaw' - Position + yaw only (best compromise: IMU for roll/pitch, mocap for yaw)
         # 'full_pose' - Full 6DoF pose (may be noisy for orientation)
         self.declare_parameter('mocap_mode', 'position_only')
+        # Trajectory CSV path for playback (time_ms, x, y, z, yaw). Press T while flying to play.
+        self.declare_parameter('trajectory_file', 'trajectory.csv')
         
         # Get parameters
         self.uri = self.get_parameter('uri').value
@@ -571,6 +692,7 @@ class CrazyflieROS2Node(Node):
         self.axis_sign = list(self.get_parameter('axis_sign').value)
         self.yaw_offset_rad = math.radians(self.get_parameter('yaw_offset_deg').value)
         self.mocap_mode = self.get_parameter('mocap_mode').value
+        self.trajectory_file = self.get_parameter('trajectory_file').value
         
         self.get_logger().info(f'URI: {self.uri}')
         self.get_logger().info(f'Use MoCap: {self.use_mocap}')
@@ -596,7 +718,11 @@ class CrazyflieROS2Node(Node):
             self.get_logger().info('MoCap disabled - using Flow Deck only')
         
         # Create controller
-        self.controller = CrazyflieController(self.uri, use_mocap=self.use_mocap)
+        self.controller = CrazyflieController(
+            self.uri,
+            use_mocap=self.use_mocap,
+            trajectory_file=self.trajectory_file,
+        )
         
     def mocap_callback(self, msg):
         """Callback for mocap pose data"""

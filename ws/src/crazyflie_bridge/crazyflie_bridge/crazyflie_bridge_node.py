@@ -21,7 +21,9 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 import threading
 
-
+# Crazyflie URI
+URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E8')
+DELTA = 0.20
 def quaternion_to_yaw(qx, qy, qz, qw):
     """Extract yaw (rotation around Z) from quaternion in radians."""
     # Yaw (z-axis rotation)
@@ -95,11 +97,9 @@ def yaw_to_quaternion(yaw):
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Crazyflie URI
-URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E7')
 
 class CrazyflieController:
-    def __init__(self, uri, use_mocap=True, trajectory_file=''):
+    def __init__(self, uri, use_mocap=True, trajectory_file='', trajectory_offset=None):
         self.uri = uri
         self.scf = None
         self.is_flying = False
@@ -107,6 +107,7 @@ class CrazyflieController:
         self.state = 'IDLE'  # IDLE, TAKING_OFF, FLYING, LANDING, PLAYING_TRAJECTORY
         self.use_mocap = use_mocap
         self.trajectory_file = trajectory_file or 'trajectory.csv'
+        self.trajectory_offset = trajectory_offset or [0.0, 0.0, 0.0, 0.0]  # [x, y, z, yaw_deg]
         
         # Target position for mocap mode
         self.target_x = 0.0
@@ -260,7 +261,8 @@ class CrazyflieController:
             logger.info("  a/d = move left/right (body frame, 0.1m)")
             logger.info("  e/r = rotate yaw left/right (15 deg)")
             logger.info("  0 = reset yaw reference (drone must face +X)")
-            logger.info("  T = play trajectory from CSV (time_ms, dx, dy, dz, dyaw) relative to current pose")
+            logger.info("  g = go to trajectory zero point (trajectory_offset)")
+            logger.info("  T = play trajectory from CSV (time_ms, dx, dy, dz, dyaw) using configured offset")
             logger.info("  1 = switch to PID controller")
             logger.info("  6 = switch to INDI controller")
             logger.info("  q = quit and land")
@@ -511,19 +513,19 @@ class CrazyflieController:
         elif key == '+' or key == '=':
             if self.state == 'FLYING':
                 if self.use_mocap:
-                    self.target_z = min(self.target_z + 0.1, 2.0)
+                    self.target_z = min(self.target_z + DELTA, 2.0)
                     logger.info(f"⬆ Increasing height to {self.target_z:.2f}m")
                 else:
-                    self.target_height = min(self.target_height + 0.1, 1.5)
+                    self.target_height = min(self.target_height + DELTA, 1.5)
                     logger.info(f"⬆ Increasing height to {self.target_height:.2f}m")
         
         elif key == '-' or key == '_':
             if self.state == 'FLYING':
                 if self.use_mocap:
-                    self.target_z = max(self.target_z - 0.1, 0.2)
+                    self.target_z = max(self.target_z - DELTA, 0.2)
                     logger.info(f"⬇ Decreasing height to {self.target_z:.2f}m")
                 else:
-                    self.target_height = max(self.target_height - 0.1, 0.2)
+                    self.target_height = max(self.target_height - DELTA, 0.2)
                     logger.info(f"⬇ Decreasing height to {self.target_height:.2f}m")
         
         # Yaw control
@@ -558,14 +560,34 @@ class CrazyflieController:
             except Exception as e:
                 logger.error(f"Failed to set controller: {e}")
         
-        # Trajectory playback from CSV (T = shift+t). Trajectory is relative to current position.
+        # Go to trajectory zero point (g): the configured trajectory offset in world frame.
+        elif key == 'g':
+            if self.state == 'FLYING' and self.use_mocap:
+                ox_off, oy_off, oz_off, oyaw_off = self.trajectory_offset
+                self.target_x = ox_off
+                self.target_y = oy_off
+                self.target_z = oz_off
+                self.target_yaw = oyaw_off
+                while self.target_yaw > 180:
+                    self.target_yaw -= 360
+                while self.target_yaw < -180:
+                    self.target_yaw += 360
+                logger.info(
+                    f"📍 Moved target to trajectory zero (offset): "
+                    f"({self.target_x:.2f}, {self.target_y:.2f}, {self.target_z:.2f}), "
+                    f"yaw={self.target_yaw:.1f}°"
+                )
+            else:
+                logger.warning("⚠ Go to trajectory zero only when FLYING with mocap (press g)")
+
+        # Trajectory playback from CSV (T = shift+t). Each point is offset by trajectory_offset.
         elif key == 'T':
             if self.state == 'FLYING' and self.use_mocap:
                 self.trajectory_waypoints = self.load_trajectory(self.trajectory_file)
                 if not self.trajectory_waypoints:
                     logger.warning("No trajectory loaded - check trajectory_file path")
                 else:
-                    self.trajectory_origin = (self.target_x, self.target_y, self.target_z, self.target_yaw)
+                    self.trajectory_origin = tuple(self.trajectory_offset)
                     self.trajectory_next_index = 0
                     self.state = 'PLAYING_TRAJECTORY'
                     self.trajectory_start_time = time.time()
@@ -576,7 +598,8 @@ class CrazyflieController:
                         self.mocap_log_file.write("time_ms,x,y,z,yaw_deg\n")
                         self.mocap_log_file.flush()
                         logger.info(
-                            f"▶ Playing trajectory from {self.trajectory_file} (origin=current position), "
+                            f"▶ Playing trajectory from {self.trajectory_file} "
+                            f"(offset={self.trajectory_offset}), "
                             f"logging mocap (relative) to {mocap_log_path}"
                         )
                     except OSError as e:
@@ -601,48 +624,48 @@ class CrazyflieController:
             if self.state == 'FLYING':
                 if self.use_mocap:
                     # Move forward in body frame -> transform to world frame
-                    dx_world, dy_world = body_to_world_displacement(0.1, 0.0, self.current_yaw)
+                    dx_world, dy_world = body_to_world_displacement(DELTA, 0.0, self.current_yaw)
                     self.target_x += dx_world
                     self.target_y += dy_world
                     logger.info(f"↑ Forward (body) -> world ({self.target_x:.2f}, {self.target_y:.2f})")
                 else:
-                    self.vx = min(self.vx + 0.1, 0.5)
+                    self.vx = min(self.vx + DELTA, 0.5)
                     logger.info(f"→ Forward velocity: {self.vx:.2f} m/s")
         
         elif key == 's':
             if self.state == 'FLYING':
                 if self.use_mocap:
                     # Move backward in body frame -> transform to world frame
-                    dx_world, dy_world = body_to_world_displacement(-0.1, 0.0, self.current_yaw)
+                    dx_world, dy_world = body_to_world_displacement(-DELTA, 0.0, self.current_yaw)
                     self.target_x += dx_world
                     self.target_y += dy_world
                     logger.info(f"↓ Backward (body) -> world ({self.target_x:.2f}, {self.target_y:.2f})")
                 else:
-                    self.vx = max(self.vx - 0.1, -0.5)
+                    self.vx = max(self.vx - DELTA, -0.5)
                     logger.info(f"← Backward velocity: {self.vx:.2f} m/s")
         
         elif key == 'a':
             if self.state == 'FLYING':
                 if self.use_mocap:
                     # Move left in body frame -> transform to world frame
-                    dx_world, dy_world = body_to_world_displacement(0.0, 0.1, self.current_yaw)
+                    dx_world, dy_world = body_to_world_displacement(0.0, DELTA, self.current_yaw)
                     self.target_x += dx_world
                     self.target_y += dy_world
                     logger.info(f"← Left (body) -> world ({self.target_x:.2f}, {self.target_y:.2f})")
                 else:
-                    self.vy = min(self.vy + 0.1, 0.5)
+                    self.vy = min(self.vy + DELTA, 0.5)
                     logger.info(f"← Left velocity: {self.vy:.2f} m/s")
         
         elif key == 'd':
             if self.state == 'FLYING':
                 if self.use_mocap:
                     # Move right in body frame -> transform to world frame
-                    dx_world, dy_world = body_to_world_displacement(0.0, -0.1, self.current_yaw)
+                    dx_world, dy_world = body_to_world_displacement(0.0, -DELTA, self.current_yaw)
                     self.target_x += dx_world
                     self.target_y += dy_world
                     logger.info(f"→ Right (body) -> world ({self.target_x:.2f}, {self.target_y:.2f})")
                 else:
-                    self.vy = max(self.vy - 0.1, -0.5)
+                    self.vy = max(self.vy - DELTA, -0.5)
                     logger.info(f"→ Right velocity: {self.vy:.2f} m/s")
         
         elif key == 'q':
@@ -684,7 +707,11 @@ class CrazyflieROS2Node(Node):
         self.declare_parameter('mocap_mode', 'position_only')
         # Trajectory CSV path for playback (time_ms, x, y, z, yaw). Press T while flying to play.
         self.declare_parameter('trajectory_file', 'trajectory.csv')
-        
+        # Trajectory offset [x, y, z, yaw_deg] in world frame.
+        # Each CSV point is applied as: world_target = trajectory_offset + trajectory_point.
+        # Trajectory point (0, 0, 0, 0) is located at trajectory_offset.
+        self.declare_parameter('trajectory_offset', [0.2, -0.6, 0.5, 0.0])
+        # x=0.390 y=-0.582 z=0.517
         # Get parameters
         self.uri = self.get_parameter('uri').value
         self.use_mocap = self.get_parameter('use_mocap').value
@@ -693,6 +720,15 @@ class CrazyflieROS2Node(Node):
         self.yaw_offset_rad = math.radians(self.get_parameter('yaw_offset_deg').value)
         self.mocap_mode = self.get_parameter('mocap_mode').value
         self.trajectory_file = self.get_parameter('trajectory_file').value
+        self.trajectory_offset = list(self.get_parameter('trajectory_offset').value)
+        if len(self.trajectory_offset) != 4:
+            self.get_logger().warning(
+                f"trajectory_offset must have 4 values [x, y, z, yaw_deg]; got {self.trajectory_offset}. "
+                "Falling back to [0.0, 0.0, 0.0, 0.0]."
+            )
+            self.trajectory_offset = [0.0, 0.0, 0.0, 0.0]
+        else:
+            self.trajectory_offset = [float(v) for v in self.trajectory_offset]
         
         self.get_logger().info(f'URI: {self.uri}')
         self.get_logger().info(f'Use MoCap: {self.use_mocap}')
@@ -700,6 +736,7 @@ class CrazyflieROS2Node(Node):
         self.get_logger().info(f'Axis mapping: {self.axis_mapping}')
         self.get_logger().info(f'Axis sign: {self.axis_sign}')
         self.get_logger().info(f'Yaw offset: {math.degrees(self.yaw_offset_rad):.1f}°')
+        self.get_logger().info(f'Trajectory offset [x, y, z, yaw_deg]: {self.trajectory_offset}')
         
         # Setup mocap if enabled
         self.mocap_pose = None
@@ -722,6 +759,7 @@ class CrazyflieROS2Node(Node):
             self.uri,
             use_mocap=self.use_mocap,
             trajectory_file=self.trajectory_file,
+            trajectory_offset=self.trajectory_offset,
         )
         
     def mocap_callback(self, msg):

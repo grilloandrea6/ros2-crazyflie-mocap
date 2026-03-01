@@ -324,8 +324,15 @@ class CrazyflieController:
                                         rel_yaw -= 360
                                     elif rel_yaw < -180:
                                         rel_yaw += 360
+                                    sp_rel_yaw = self.target_yaw - oyaw
+                                    if sp_rel_yaw > 180:
+                                        sp_rel_yaw -= 360
+                                    elif sp_rel_yaw < -180:
+                                        sp_rel_yaw += 360
                                     self.mocap_log_file.write(
-                                        f"{elapsed_ms:.2f},{x - ox:.6f},{y - oy:.6f},{z - oz:.6f},{rel_yaw:.4f}\n"
+                                        f"{elapsed_ms:.2f},{x - ox:.6f},{y - oy:.6f},{z - oz:.6f},{rel_yaw:.4f},"
+                                        f"{self.target_x - ox:.6f},{self.target_y - oy:.6f},{self.target_z - oz:.6f},"
+                                        f"{sp_rel_yaw:.4f}\n"
                                     )
                                     self.mocap_log_file.flush()
                                 if mode == 'position_only':
@@ -595,12 +602,14 @@ class CrazyflieController:
                     mocap_log_path = f"mocap_log_{ts}.csv"
                     try:
                         self.mocap_log_file = open(mocap_log_path, 'w')
-                        self.mocap_log_file.write("time_ms,x,y,z,yaw_deg\n")
+                        self.mocap_log_file.write(
+                            "time_ms,x,y,z,yaw_deg,sp_x,sp_y,sp_z,sp_yaw_deg\n"
+                        )
                         self.mocap_log_file.flush()
                         logger.info(
                             f"▶ Playing trajectory from {self.trajectory_file} "
                             f"(offset={self.trajectory_offset}), "
-                            f"logging mocap (relative) to {mocap_log_path}"
+                            f"logging mocap+setpoint (relative) to {mocap_log_path}"
                         )
                     except OSError as e:
                         logger.error(f"Could not open mocap log file {mocap_log_path}: {e}")
